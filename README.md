@@ -11,6 +11,12 @@ A Swift CLI daemon that automatically switches your Mac's appearance (light/dark
 ## Install
 
 ```
+brew install bn-l/tap/mononi
+```
+
+Or build from source:
+
+```
 swift build -c release
 cp .build/release/mononi /usr/local/bin/
 ```

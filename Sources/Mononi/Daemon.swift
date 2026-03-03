@@ -5,34 +5,88 @@ private let logger = Logger(subsystem: "com.mononi", category: "Daemon")
 
 @MainActor
 enum Daemon {
+    private static let pollInterval: Duration = .seconds(300)
+
     static func run() async throws {
-        logger.info("mononi daemon starting")
+        logger.info("mononi daemon starting, config: \(ConfigManager.configFile.path, privacy: .public)")
 
-        let config = try ConfigManager.load()
-        try applyCurrentMode(config)
+        var lastMtime = configFileMtime()
+        logger.info("Initial config mtime: \(lastMtime?.description ?? "nil (using defaults)", privacy: .public)")
 
-        // Schedule transitions in a loop
+        var config = try ConfigManager.load()
+        logScheduleSummary(config)
+        try await applyCurrentMode(config)
+
         while !Task.isCancelled {
-            let config = try ConfigManager.load()
             guard let next = config.nextTransition() else {
-                logger.error("No transitions configured, sleeping 1h")
-                try await Task.sleep(for: .seconds(3600))
+                logger.warning("No transitions configured, polling until config changes")
+                try await pollUntilConfigChanges(&lastMtime)
+                config = reloadConfig(fallback: config)
+                logScheduleSummary(config)
                 continue
             }
 
-            let delay = next.fireDate.timeIntervalSinceNow
-            if delay > 0 {
-                logger.info("Next: '\(next.name, privacy: .public)' in \(Int(delay))s at \(next.config.startTime, privacy: .public)")
-                try await Task.sleep(for: .seconds(delay))
+            logger.info("Next: '\(next.name, privacy: .public)' in \(Int(next.fireDate.timeIntervalSinceNow))s at \(next.config.startTime, privacy: .public)")
+
+            // Poll in short intervals — wake on config change or transition time
+            var configChanged = false
+            while !Task.isCancelled && next.fireDate.timeIntervalSinceNow > 0 {
+                try await Task.sleep(for: pollInterval)
+                let currentMtime = configFileMtime()
+                if currentMtime != lastMtime {
+                    lastMtime = currentMtime
+                    logger.info("Config file changed, reloading")
+                    configChanged = true
+                    break
+                }
             }
 
-            // Re-read config in case it changed while sleeping
-            let freshConfig = try ConfigManager.load()
-            try applyCurrentMode(freshConfig)
+            if !configChanged {
+                logger.info("Scheduled transition reached: '\(next.name, privacy: .public)'")
+            }
+
+            config = reloadConfig(fallback: config)
+            try await applyCurrentMode(config)
         }
     }
 
-    private static func applyCurrentMode(_ config: MononiConfig) throws {
+    private static func pollUntilConfigChanges(_ lastMtime: inout Date?) async throws {
+        while !Task.isCancelled {
+            try await Task.sleep(for: pollInterval)
+            let currentMtime = configFileMtime()
+            if currentMtime != lastMtime {
+                lastMtime = currentMtime
+                logger.info("Config file changed, reloading")
+                return
+            }
+        }
+    }
+
+    private static func reloadConfig(fallback: MononiConfig) -> MononiConfig {
+        do {
+            return try ConfigManager.load()
+        } catch {
+            logger.error("Failed to reload config: \(error, privacy: .public), keeping previous")
+            return fallback
+        }
+    }
+
+    private static func configFileMtime() -> Date? {
+        try? FileManager.default.attributesOfItem(
+            atPath: ConfigManager.configFile.path
+        )[.modificationDate] as? Date
+    }
+
+    private static func logScheduleSummary(_ config: MononiConfig) {
+        let sorted = config.sortedModes
+        let summary = sorted.map { "\($0.name)@\($0.config.startTime)" }.joined(separator: ", ")
+        logger.info("Schedule: \(summary, privacy: .public)")
+        if let active = config.activeMode() {
+            logger.info("Active mode: '\(active.name, privacy: .public)' (\(active.config.appearance, privacy: .public), \(active.config.wallpaper, privacy: .public))")
+        }
+    }
+
+    private static func applyCurrentMode(_ config: MononiConfig) async throws {
         guard let mode = config.activeMode() else {
             logger.warning("No active mode found for current time")
             return
@@ -46,6 +100,9 @@ enum Daemon {
         } catch {
             logger.error("Failed to set appearance: \(error, privacy: .public)")
         }
+
+        // Let macOS propagate the appearance change before touching wallpaper state
+        try await Task.sleep(for: .seconds(1))
 
         do {
             try ThemeManager.setWallpaper(named: mode.config.wallpaper)

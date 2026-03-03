@@ -68,13 +68,6 @@ app: build icns
     PLIST
     echo "Built {{app_name}}.app → .build/{{app_name}}.app"
 
-# Install binary to PATH and .app to /Applications
-install: app
-    cp .build/release/{{name}} /usr/local/bin/{{name}}
-    cp -R ".build/{{app_name}}.app" "/Applications/{{app_name}}.app"
-    @echo "Installed {{name}} → /usr/local/bin/{{name}}"
-    @echo "Installed {{app_name}}.app → /Applications/{{app_name}}.app"
-
 # Clean build artifacts
 clean:
     swift package clean

@@ -73,8 +73,8 @@ enum ThemeManager {
 
     private static func setAerialWallpaper(assetID: String, name: String) throws {
         try writeAerialPlist(assetID: assetID)
+        logger.info("Aerial plist written for '\(name, privacy: .public)' (id: \(assetID, privacy: .public))")
         restartWallpaperAgent()
-        logger.info("Aerial wallpaper set: \(name, privacy: .public) (id: \(assetID, privacy: .public))")
     }
 
     // MARK: - Static Wallpapers (.heic, .madesktop)
@@ -166,8 +166,22 @@ enum ThemeManager {
         let task = Process()
         task.executableURL = URL(filePath: "/usr/bin/killall")
         task.arguments = ["WallpaperAgent"]
-        try? task.run()
-        task.waitUntilExit()
+        let errPipe = Pipe()
+        task.standardError = errPipe
+        do {
+            try task.run()
+            task.waitUntilExit()
+            if task.terminationStatus == 0 {
+                logger.info("WallpaperAgent restarted")
+            } else {
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let errMsg = String(data: errData, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                logger.error("killall WallpaperAgent exited with status \(task.terminationStatus): \(errMsg, privacy: .public)")
+            }
+        } catch {
+            logger.error("Failed to launch killall WallpaperAgent: \(error, privacy: .public)")
+        }
     }
 
     // MARK: - Listing

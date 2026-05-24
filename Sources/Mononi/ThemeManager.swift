@@ -26,10 +26,17 @@ enum ThemeManager {
 
     // MARK: - Wallpaper
 
-    static func setWallpaper(named name: String) throws {
+    static func setWallpaper(named name: String) async throws {
         // 1. Try aerial wallpapers from manifest (most common case for video wallpapers)
-        if let assetID = findAerialAssetID(named: name) {
-            try setAerialWallpaper(assetID: assetID, name: name)
+        if let asset = findAerialAsset(named: name) {
+            let videoFile = aerialsDir.appendingPathComponent("videos/\(asset.id).mov")
+            if !FileManager.default.fileExists(atPath: videoFile.path) {
+                guard let urlString = asset.url, let url = URL(string: urlString) else {
+                    throw MononiError.aerialNotDownloaded(name)
+                }
+                try await downloadAerialVideo(from: url, to: videoFile, name: name)
+            }
+            try setAerialWallpaper(assetID: asset.id, name: name)
             return
         }
 
@@ -49,7 +56,12 @@ enum ThemeManager {
             .appendingPathComponent("Library/Application Support/com.apple.wallpaper/aerials")
     }()
 
-    private static func findAerialAssetID(named name: String) -> String? {
+    private struct AerialAsset {
+        let id: String
+        let url: String?
+    }
+
+    private static func findAerialAsset(named name: String) -> AerialAsset? {
         let manifestFile = aerialsDir.appendingPathComponent("manifest/entries.json")
         guard let data = try? Data(contentsOf: manifestFile),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -62,13 +74,28 @@ enum ThemeManager {
 
         guard let id = asset["id"] as? String else { return nil }
 
-        let videoFile = aerialsDir.appendingPathComponent("videos/\(id).mov")
-        guard FileManager.default.fileExists(atPath: videoFile.path) else {
-            logger.warning("Aerial '\(name, privacy: .public)' found in manifest but video not downloaded (id: \(id, privacy: .public))")
-            return nil
+        // Prefer 4K SDR, the most common format
+        let url = asset["url-4K-SDR-240FPS"] as? String
+
+        return AerialAsset(id: id, url: url)
+    }
+
+    private static func downloadAerialVideo(from url: URL, to destination: URL, name: String) async throws {
+        logger.info("Downloading aerial '\(name, privacy: .public)' from \(url.absoluteString, privacy: .public)")
+        fputs("Downloading '\(name)'...\n", stderr)
+
+        let (tempURL, response) = try await URLSession.shared.download(from: url)
+
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw MononiError.downloadFailed(name, "HTTP \(code)")
         }
 
-        return id
+        try FileManager.default.moveItem(at: tempURL, to: destination)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+
+        logger.info("Downloaded aerial '\(name, privacy: .public)' to \(destination.path, privacy: .public)")
+        fputs("Downloaded '\(name)'\n", stderr)
     }
 
     private static func setAerialWallpaper(assetID: String, name: String) throws {
@@ -228,12 +255,16 @@ enum ThemeManager {
 enum MononiError: Error, CustomStringConvertible {
     case appleScriptFailed(String)
     case wallpaperNotFound(String)
+    case aerialNotDownloaded(String)
+    case downloadFailed(String, String)
     case configError(String)
 
     var description: String {
         switch self {
         case .appleScriptFailed(let msg): "AppleScript error: \(msg)"
         case .wallpaperNotFound(let name): "Wallpaper not found: '\(name)'"
+        case .aerialNotDownloaded(let name): "Aerial '\(name)' exists in manifest but video is not downloaded and no download URL is available. Re-download it in System Settings > Wallpaper."
+        case .downloadFailed(let name, let reason): "Failed to download aerial '\(name)': \(reason)"
         case .configError(let msg): "Config error: \(msg)"
         }
     }

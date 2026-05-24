@@ -105,7 +105,7 @@ enum Daemon {
         try await Task.sleep(for: .seconds(1))
 
         do {
-            try ThemeManager.setWallpaper(named: mode.config.wallpaper)
+            try await ThemeManager.setWallpaper(named: mode.config.wallpaper)
         } catch {
             logger.error("Failed to set wallpaper: \(error, privacy: .public)")
         }

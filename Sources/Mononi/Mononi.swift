@@ -100,19 +100,19 @@ struct Apply: AsyncParsableCommand {
             guard let modeConfig = config.modes[modeName] else {
                 throw MononiError.configError("Unknown mode: '\(modeName)'. Available: \(config.modes.keys.sorted().joined(separator: ", "))")
             }
-            try applyMode(name: modeName, config: modeConfig)
+            try await applyMode(name: modeName, config: modeConfig)
         } else {
             guard let active = config.activeMode() else {
                 throw MononiError.configError("No mode configured for current time")
             }
-            try applyMode(name: active.name, config: active.config)
+            try await applyMode(name: active.name, config: active.config)
         }
     }
 
-    private func applyMode(name: String, config: ModeConfig) throws {
+    private func applyMode(name: String, config: ModeConfig) async throws {
         print("Applying '\(name)': \(config.appearance), \(config.wallpaper)")
         try ThemeManager.setAppearance(dark: config.appearance == "dark")
-        try ThemeManager.setWallpaper(named: config.wallpaper)
+        try await ThemeManager.setWallpaper(named: config.wallpaper)
         print("Done")
     }
 }

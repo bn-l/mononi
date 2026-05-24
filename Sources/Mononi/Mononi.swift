@@ -6,7 +6,7 @@ struct Mononi: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "mononi",
         abstract: "Theme scheduler for macOS — morning, noon, and night",
-        version: "0.2.0",
+        version: "0.3.0",
         subcommands: [
             Start.self,
             Stop.self,

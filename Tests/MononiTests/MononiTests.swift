@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Testing
 
 @testable import mononi
@@ -467,5 +468,113 @@ struct LaunchAgentTests {
     func plistPath() {
         let path = LaunchAgent.plistURL.path
         #expect(path.contains("Library/LaunchAgents/com.mononi.agent.plist"))
+    }
+}
+
+// MARK: - ThemeApplier sequencing (stand-in)
+
+/// Records the order of effects so a test can assert the appearance is set before the wallpaper.
+final class SpyEffects: ThemeEffects {
+    enum Step: Equatable, Sendable {
+        case appearance(dark: Bool)
+        case wallpaper(String)
+    }
+
+    private let box = Mutex<[Step]>([])
+    var steps: [Step] { box.withLock { $0 } }
+
+    func setAppearance(dark: Bool) throws { box.withLock { $0.append(.appearance(dark: dark)) } }
+    func setWallpaper(named name: String) async throws { box.withLock { $0.append(.wallpaper(name)) } }
+}
+
+@Suite("ThemeApplier sequencing")
+struct ThemeApplierTests {
+    // The order matters: the wallpaper step verifies-and-retries against WallpaperAgent
+    // reverting it, and only the appearance change triggers a revert. Setting the appearance
+    // first means that retry loop runs after the change and can recover from it.
+    @Test("sets the appearance before the wallpaper")
+    func appearanceBeforeWallpaper() async throws {
+        let spy = SpyEffects()
+        try await ThemeApplier.apply(appearance: "dark", wallpaper: "Tahoe Night", using: spy)
+        #expect(spy.steps == [.appearance(dark: true), .wallpaper("Tahoe Night")])
+    }
+
+    @Test("light appearance applies dark:false")
+    func lightAppearance() async throws {
+        let spy = SpyEffects()
+        try await ThemeApplier.apply(appearance: "light", wallpaper: "Tahoe Morning", using: spy)
+        #expect(spy.steps.first == .appearance(dark: false))
+    }
+}
+
+// MARK: - ThemeApplier end-to-end (real system; opt-in via MONONI_E2E)
+
+/// Reads dark mode straight from System Events so it reflects a change made in this
+/// same process, rather than a possibly-cached UserDefaults value.
+private func systemDarkMode() -> Bool {
+    let task = Process()
+    task.executableURL = URL(filePath: "/usr/bin/osascript")
+    task.arguments = ["-e", "tell application \"System Events\" to tell appearance preferences to get dark mode"]
+    let out = Pipe()
+    task.standardOutput = out
+    task.standardError = Pipe()
+    try? task.run()
+    task.waitUntilExit()
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) == "true"
+}
+
+/// The path where downloaded aerial videos live, used to keep the e2e test to aerials
+/// that are already on disk so it never triggers a download.
+private let aerialVideosDir = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Application Support/com.apple.wallpaper/aerials/videos")
+
+@Suite("ThemeApplier e2e", .enabled(if: ProcessInfo.processInfo.environment["MONONI_E2E"] != nil))
+struct ThemeApplierE2ETests {
+    /// Applies a wallpaper while flipping the appearance, which is what triggers the race,
+    /// and confirms Index.plist still holds the wallpaper afterwards. WallpaperAgent reverts
+    /// Index.plist on roughly one flip in eight, so a single flip is not enough; the test
+    /// repeats the flip and fails on the first revert. With verify-and-retry in place the
+    /// applier rewrites until it holds, so no iteration is left reverted. The count is
+    /// configurable with MONONI_E2E_ITERS.
+    @Test("the aerial wallpaper survives repeated appearance flips")
+    func wallpaperSurvivesAppearanceFlips() async throws {
+        func isDownloaded(_ id: String) -> Bool {
+            FileManager.default.fileExists(atPath: aerialVideosDir.appendingPathComponent("\(id).mov").path)
+        }
+
+        let aerials = ThemeManager.listAvailableWallpapers().compactMap { name in
+            ThemeManager.findAerialAsset(named: name).map { (name: name, id: $0.id) }
+        }.filter { isDownloaded($0.id) }
+        try #require(aerials.count >= 2, "Need at least two downloaded aerial wallpapers")
+        let first = aerials[0]
+        let second = aerials[1]
+
+        let indexURL = ThemeManager.wallpaperIndexURL
+        let originalDark = systemDarkMode()
+        let backup = try Data(contentsOf: indexURL)
+        defer {
+            try? backup.write(to: indexURL)
+            try? ThemeManager.setAppearance(dark: originalDark)
+            ThemeManager.restartWallpaperAgent()
+        }
+
+        let iterations = Int(ProcessInfo.processInfo.environment["MONONI_E2E_ITERS"] ?? "") ?? 30
+        for i in 0..<iterations {
+            // Alternate the appearance each time so every apply flips it, and alternate the
+            // wallpaper so a revert shows up as the other asset id rather than going unnoticed.
+            let dark = i.isMultiple(of: 2)
+            let target = dark ? second : first
+            try await ThemeApplier.apply(appearance: dark ? "dark" : "light", wallpaper: target.name)
+
+            try await Task.sleep(for: .seconds(1.5))
+            let ids = ThemeManager.currentAerialAssetIDs()
+            guard ids == Set([target.id]) else {
+                Issue.record(
+                    "Flip \(i + 1)/\(iterations): applied '\(target.name)' (\(target.id)) but Index.plist holds \(ids); WallpaperAgent reverted it"
+                )
+                return
+            }
+        }
     }
 }

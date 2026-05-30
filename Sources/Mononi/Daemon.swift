@@ -94,20 +94,10 @@ enum Daemon {
 
         logger.info("Applying mode '\(mode.name, privacy: .public)': appearance=\(mode.config.appearance, privacy: .public), wallpaper=\(mode.config.wallpaper, privacy: .public)")
 
-        let isDark = mode.config.appearance == "dark"
         do {
-            try ThemeManager.setAppearance(dark: isDark)
+            try await ThemeApplier.apply(appearance: mode.config.appearance, wallpaper: mode.config.wallpaper)
         } catch {
-            logger.error("Failed to set appearance: \(error, privacy: .public)")
-        }
-
-        // Let macOS propagate the appearance change before touching wallpaper state
-        try await Task.sleep(for: .seconds(1))
-
-        do {
-            try await ThemeManager.setWallpaper(named: mode.config.wallpaper)
-        } catch {
-            logger.error("Failed to set wallpaper: \(error, privacy: .public)")
+            logger.error("Failed to apply mode '\(mode.name, privacy: .public)': \(error, privacy: .public)")
         }
     }
 }

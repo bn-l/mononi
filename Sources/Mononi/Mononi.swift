@@ -111,8 +111,7 @@ struct Apply: AsyncParsableCommand {
 
     private func applyMode(name: String, config: ModeConfig) async throws {
         print("Applying '\(name)': \(config.appearance), \(config.wallpaper)")
-        try ThemeManager.setAppearance(dark: config.appearance == "dark")
-        try await ThemeManager.setWallpaper(named: config.wallpaper)
+        try await ThemeApplier.apply(appearance: config.appearance, wallpaper: config.wallpaper)
         print("Done")
     }
 }

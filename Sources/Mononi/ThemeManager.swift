@@ -36,7 +36,7 @@ enum ThemeManager {
                 }
                 try await downloadAerialVideo(from: url, to: videoFile, name: name)
             }
-            try setAerialWallpaper(assetID: asset.id, name: name)
+            try await setAerialWallpaper(assetID: asset.id, name: name)
             return
         }
 
@@ -56,12 +56,12 @@ enum ThemeManager {
             .appendingPathComponent("Library/Application Support/com.apple.wallpaper/aerials")
     }()
 
-    private struct AerialAsset {
+    struct AerialAsset {
         let id: String
         let url: String?
     }
 
-    private static func findAerialAsset(named name: String) -> AerialAsset? {
+    static func findAerialAsset(named name: String) -> AerialAsset? {
         let manifestFile = aerialsDir.appendingPathComponent("manifest/entries.json")
         guard let data = try? Data(contentsOf: manifestFile),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -98,10 +98,62 @@ enum ThemeManager {
         fputs("Downloaded '\(name)'\n", stderr)
     }
 
-    private static func setAerialWallpaper(assetID: String, name: String) throws {
-        try writeAerialPlist(assetID: assetID)
-        logger.info("Aerial plist written for '\(name, privacy: .public)' (id: \(assetID, privacy: .public))")
-        restartWallpaperAgent()
+    static let aerialVerifyDelay: Duration = .seconds(1.5)
+    static let aerialMaxAttempts = 4
+
+    /// Write the aerial plist, restart WallpaperAgent, then read Index.plist back to confirm
+    /// it stuck. A concurrent appearance change makes WallpaperAgent occasionally revert the
+    /// file to the previous wallpaper, so on a revert we write and restart again, up to a cap.
+    /// The retry races no appearance change (it has long since settled) and reliably holds.
+    private static func setAerialWallpaper(assetID: String, name: String) async throws {
+        for attempt in 1...aerialMaxAttempts {
+            try writeAerialPlist(assetID: assetID)
+            restartWallpaperAgent()
+            try await Task.sleep(for: aerialVerifyDelay)
+
+            if currentAerialAssetIDs() == [assetID] {
+                logger.info("Aerial '\(name, privacy: .public)' applied (id: \(assetID, privacy: .public), attempt \(attempt)/\(aerialMaxAttempts))")
+                return
+            }
+            if attempt < aerialMaxAttempts {
+                logger.warning("Aerial '\(name, privacy: .public)' was reverted by WallpaperAgent (attempt \(attempt)/\(aerialMaxAttempts)); retrying")
+            }
+        }
+        logger.error("Aerial '\(name, privacy: .public)' kept being reverted by WallpaperAgent; gave up after \(aerialMaxAttempts) attempts")
+        throw MononiError.wallpaperNotApplied(name)
+    }
+
+    /// The aerial asset IDs currently referenced by Index.plist across all displays/spaces.
+    /// Each lives inside a nested binary-plist blob under Content → Choices → Configuration.
+    static func currentAerialAssetIDs() -> Set<String> {
+        guard let data = try? Data(contentsOf: wallpaperIndexURL),
+              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+        else { return [] }
+
+        var ids = Set<String>()
+        func collect(_ entry: Any?) {
+            guard let entry = entry as? [String: Any],
+                  let content = entry["Content"] as? [String: Any],
+                  let choices = content["Choices"] as? [[String: Any]] else { return }
+            for choice in choices {
+                guard let cfgData = choice["Configuration"] as? Data,
+                      let cfg = try? PropertyListSerialization.propertyList(from: cfgData, format: nil) as? [String: Any],
+                      let id = cfg["assetID"] as? String else { continue }
+                ids.insert(id)
+            }
+        }
+        if let all = plist["AllSpacesAndDisplays"] as? [String: Any] {
+            collect(all["Desktop"])
+            collect(all["Idle"])
+        }
+        if let displays = plist["Displays"] as? [String: Any] {
+            for value in displays.values {
+                let entry = value as? [String: Any]
+                collect(entry?["Desktop"])
+                collect(entry?["Idle"])
+            }
+        }
+        return ids
     }
 
     // MARK: - Static Wallpapers (.heic, .madesktop)
@@ -127,7 +179,7 @@ enum ThemeManager {
 
     // MARK: - Plist Manipulation
 
-    private static let wallpaperIndexURL: URL = {
+    static let wallpaperIndexURL: URL = {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/com.apple.wallpaper/Store/Index.plist")
     }()
@@ -189,7 +241,7 @@ enum ThemeManager {
         try data.write(to: wallpaperIndexURL)
     }
 
-    private static func restartWallpaperAgent() {
+    static func restartWallpaperAgent() {
         let task = Process()
         task.executableURL = URL(filePath: "/usr/bin/killall")
         task.arguments = ["WallpaperAgent"]
@@ -252,11 +304,42 @@ enum ThemeManager {
     }
 }
 
+// MARK: - Applying a Mode
+
+/// The two side effects that applying a mode performs. Injectable so a test can
+/// record the order they run in instead of changing the real appearance and wallpaper.
+protocol ThemeEffects: Sendable {
+    func setAppearance(dark: Bool) throws
+    func setWallpaper(named name: String) async throws
+}
+
+struct LiveThemeEffects: ThemeEffects {
+    func setAppearance(dark: Bool) throws { try ThemeManager.setAppearance(dark: dark) }
+    func setWallpaper(named name: String) async throws { try await ThemeManager.setWallpaper(named: name) }
+}
+
+/// Applies an appearance and a wallpaper together. The appearance is set first, on purpose:
+/// setting the wallpaper writes Index.plist and then verifies-and-retries against
+/// WallpaperAgent reverting it, and the appearance change is the only thing that triggers a
+/// revert. Running the wallpaper step after the appearance change lets that retry loop see
+/// — and recover from — any revert. Flip the order and the revert would land unguarded.
+enum ThemeApplier {
+    static func apply(
+        appearance: String,
+        wallpaper: String,
+        using effects: any ThemeEffects = LiveThemeEffects()
+    ) async throws {
+        try effects.setAppearance(dark: appearance == "dark")
+        try await effects.setWallpaper(named: wallpaper)
+    }
+}
+
 enum MononiError: Error, CustomStringConvertible {
     case appleScriptFailed(String)
     case wallpaperNotFound(String)
     case aerialNotDownloaded(String)
     case downloadFailed(String, String)
+    case wallpaperNotApplied(String)
     case configError(String)
 
     var description: String {
@@ -265,6 +348,7 @@ enum MononiError: Error, CustomStringConvertible {
         case .wallpaperNotFound(let name): "Wallpaper not found: '\(name)'"
         case .aerialNotDownloaded(let name): "Aerial '\(name)' exists in manifest but video is not downloaded and no download URL is available. Re-download it in System Settings > Wallpaper."
         case .downloadFailed(let name, let reason): "Failed to download aerial '\(name)': \(reason)"
+        case .wallpaperNotApplied(let name): "Applied wallpaper '\(name)' but WallpaperAgent kept reverting it; gave up after \(ThemeManager.aerialMaxAttempts) attempts"
         case .configError(let msg): "Config error: \(msg)"
         }
     }

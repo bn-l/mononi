@@ -65,13 +65,13 @@ struct ModeConfigTests {
     }
 }
 
-// MARK: - Sorted Modes
+// MARK: - One Day's Transitions
 
-@Suite("MononiConfig.sortedModes")
-struct SortedModesTests {
+@Suite("MononiConfig.transitions(on:)")
+struct TransitionsOnDayTests {
     @Test("sorts default config by start time ascending")
     func defaultConfigSorting() {
-        let sorted = MononiConfig.defaultConfig.sortedModes
+        let sorted = MononiConfig.defaultConfig.transitions(on: .now)
         #expect(sorted.count == 4)
         #expect(sorted[0].name == "morning")   // 6:30
         #expect(sorted[1].name == "day")        // 12:00
@@ -85,7 +85,7 @@ struct SortedModesTests {
             "good": ModeConfig(startTime: "12:00", appearance: "light", wallpaper: "X"),
             "bad": ModeConfig(startTime: "nope", appearance: "dark", wallpaper: "Y"),
         ])
-        let sorted = config.sortedModes
+        let sorted = config.transitions(on: .now)
         #expect(sorted.count == 1)
         #expect(sorted[0].name == "good")
     }
@@ -95,7 +95,7 @@ struct SortedModesTests {
         let config = MononiConfig(modes: [
             "a": ModeConfig(startTime: "x", appearance: "light", wallpaper: "X"),
         ])
-        #expect(config.sortedModes.isEmpty)
+        #expect(config.transitions(on: .now).isEmpty)
     }
 
     @Test("handles single mode")
@@ -103,7 +103,7 @@ struct SortedModesTests {
         let config = MononiConfig(modes: [
             "only": ModeConfig(startTime: "15:00", appearance: "dark", wallpaper: "X"),
         ])
-        let sorted = config.sortedModes
+        let sorted = config.transitions(on: .now)
         #expect(sorted.count == 1)
         #expect(sorted[0].name == "only")
     }
@@ -232,7 +232,7 @@ struct NextTransitionTests {
     func earlyMorning() {
         let next = config.nextTransition(after: today(hour: 3, minute: 0))
         #expect(next?.name == "morning")
-        let comps = Calendar.current.dateComponents([.hour, .minute], from: next!.fireDate)
+        let comps = Calendar.current.dateComponents([.hour, .minute], from: next!.date)
         #expect(comps.hour == 6)
         #expect(comps.minute == 30)
     }
@@ -256,9 +256,9 @@ struct NextTransitionTests {
         #expect(next?.name == "morning")
         // Fire date should be tomorrow
         let nowDay = Calendar.current.component(.day, from: now)
-        let fireDay = Calendar.current.component(.day, from: next!.fireDate)
+        let fireDay = Calendar.current.component(.day, from: next!.date)
         #expect(fireDay != nowDay)
-        #expect(next!.fireDate > now)
+        #expect(next!.date > now)
     }
 
     @Test("next after 23:59 wraps to tomorrow morning")
@@ -283,9 +283,9 @@ struct NextTransitionTests {
         let next = single.nextTransition(after: now)
         #expect(next?.name == "only")
         let nowDay = Calendar.current.component(.day, from: now)
-        let fireDay = Calendar.current.component(.day, from: next!.fireDate)
+        let fireDay = Calendar.current.component(.day, from: next!.date)
         #expect(fireDay != nowDay)
-        #expect(next!.fireDate > now)
+        #expect(next!.date > now)
     }
 
     @Test("fire date is today when next mode is later today")
@@ -294,7 +294,7 @@ struct NextTransitionTests {
         let next = config.nextTransition(after: now)
         #expect(next?.name == "day")
         let comps = Calendar.current.dateComponents([.year, .month, .day], from: now)
-        let fireComps = Calendar.current.dateComponents([.year, .month, .day], from: next!.fireDate)
+        let fireComps = Calendar.current.dateComponents([.year, .month, .day], from: next!.date)
         #expect(comps.day == fireComps.day)
     }
 
@@ -403,13 +403,9 @@ struct DefaultConfigSanityTests {
 
     @Test("default mode times are in chronological order")
     func chronologicalOrder() {
-        let sorted = MononiConfig.defaultConfig.sortedModes
+        let sorted = MononiConfig.defaultConfig.transitions(on: .now)
         for i in 1..<sorted.count {
-            let prev = sorted[i - 1].config.startComponents!
-            let curr = sorted[i].config.startComponents!
-            let prevMins = prev.hour * 60 + prev.minute
-            let currMins = curr.hour * 60 + curr.minute
-            #expect(currMins > prevMins, "Mode '\(sorted[i].name)' is not after '\(sorted[i - 1].name)'")
+            #expect(sorted[i].date > sorted[i - 1].date, "Mode '\(sorted[i].name)' is not after '\(sorted[i - 1].name)'")
         }
     }
 

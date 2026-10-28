@@ -7,12 +7,14 @@ let package = Package(
     platforms: [.macOS(.v15)],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.7.0"),
+        .package(url: "https://github.com/ceeK/Solar", from: "4.0.1"),
     ],
     targets: [
         .executableTarget(
             name: "mononi",
             dependencies: [
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "Solar", package: "Solar"),
             ],
             swiftSettings: [
                 .swiftLanguageMode(.v6),

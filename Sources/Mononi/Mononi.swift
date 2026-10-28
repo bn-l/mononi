@@ -17,6 +17,25 @@ struct Mononi: AsyncParsableCommand {
             DaemonCmd.self,
         ]
     )
+
+    /// Prints any problems in the config file to stderr before running the command, so every command reports them.
+    static func main() async {
+        let problems = ConfigManager.problems()
+        if !problems.isEmpty {
+            fputs("Problems in \(ConfigManager.configFile.path):\n" + problems.map { "  \($0)\n" }.joined(), stderr)
+        }
+        await main(nil)
+    }
+}
+
+/// Loads the config for a command, exiting with status 1 when it cannot load. `Mononi.main` has already
+/// printed why, so the reason is not printed a second time.
+private func loadConfig(_ load: () throws -> MononiConfig = ConfigManager.load) throws -> MononiConfig {
+    do {
+        return try load()
+    } catch MononiError.configError(_) {
+        throw ExitCode.failure
+    }
 }
 
 // MARK: - Start
@@ -28,6 +47,7 @@ struct Start: AsyncParsableCommand {
 
     func run() async throws {
         try ConfigManager.ensureDefault()
+        _ = try loadConfig()
 
         if LaunchAgent.isRunning() {
             print("mononi is already running")
@@ -71,14 +91,18 @@ struct Status: AsyncParsableCommand {
         let running = LaunchAgent.isRunning()
         print("Daemon: \(running ? "running" : "stopped")")
 
-        let config = try ConfigManager.load()
-        if let mode = config.activeMode() {
-            print("Active: \(mode.name) (\(mode.config.appearance), \(mode.config.wallpaper))")
+        let config = try loadConfig()
+        print("Schedule: \(config.basis)")
+        let today = config.transitions(on: .now)
+        let width = today.map(\.name.count).max() ?? 0
+        for transition in today {
+            print("  \(transition.name.padding(toLength: width, withPad: " ", startingAt: 0))  \(transition.clockTime)  \(transition.origin)")
+        }
+        if let active = config.activeMode() {
+            print("Active: \(active.name) (\(active.mode.appearance), \(active.mode.wallpaper))")
         }
         if let next = config.nextTransition() {
-            let fmt = DateFormatter()
-            fmt.dateFormat = "HH:mm"
-            print("Next:   \(next.name) at \(fmt.string(from: next.fireDate))")
+            print("Next:   \(next.name) at \(next.clockTime)")
         }
     }
 }
@@ -94,7 +118,7 @@ struct Apply: AsyncParsableCommand {
     var mode: String?
 
     func run() async throws {
-        let config = try ConfigManager.load()
+        let config = try loadConfig()
 
         if let modeName = mode {
             guard let modeConfig = config.modes[modeName] else {
@@ -105,7 +129,7 @@ struct Apply: AsyncParsableCommand {
             guard let active = config.activeMode() else {
                 throw MononiError.configError("No mode configured for current time")
             }
-            try await applyMode(name: active.name, config: active.config)
+            try await applyMode(name: active.name, config: active.mode)
         }
     }
 
@@ -122,7 +146,7 @@ struct Config_: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "config",
         abstract: "View or modify configuration",
-        subcommands: [ConfigShow.self, ConfigSet.self, ConfigPath.self, ConfigReset.self],
+        subcommands: [ConfigShow.self, ConfigSet.self, ConfigLocation.self, ConfigPath.self, ConfigReset.self],
         defaultSubcommand: ConfigShow.self
     )
 }
@@ -134,7 +158,7 @@ struct ConfigShow: AsyncParsableCommand {
     )
 
     func run() async throws {
-        let config = try ConfigManager.load()
+        let config = try loadConfig(ConfigManager.read)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(config)
@@ -160,17 +184,24 @@ struct ConfigSet: AsyncParsableCommand {
     @Option(name: .long, help: "Wallpaper name")
     var wallpaper: String?
 
+    @Option(name: .long, parsing: .unconditional, help: "Minutes to move the stage from its sun event when a location is set, from -720 to 720; negative is earlier")
+    var offset: Int?
+
+    func validate() throws {
+        guard offset == nil || SolarStage(rawValue: modeName) != nil else {
+            throw ValidationError("Only morning, day, evening and night follow the sun, so '\(modeName)' cannot have an offset.")
+        }
+    }
+
     func run() async throws {
-        var config = try ConfigManager.load()
+        var config = try loadConfig(ConfigManager.read)
         var mode = config.modes[modeName] ?? ModeConfig(startTime: "12:00", appearance: "light", wallpaper: "Tahoe Day")
 
         if let time {
-            // Validate time format
-            let parts = time.split(separator: ":")
-            guard parts.count == 2, Int(parts[0]) != nil, Int(parts[1]) != nil else {
-                throw MononiError.configError("Invalid time format: '\(time)'. Use H:MM or HH:MM")
-            }
             mode.startTime = time
+            guard mode.startComponents != nil else {
+                throw MononiError.configError("Invalid time: '\(time)'. Use a time from 0:00 to 23:59, such as 6:30 or 18:00")
+            }
         }
         if let appearance {
             guard appearance == "light" || appearance == "dark" else {
@@ -181,10 +212,80 @@ struct ConfigSet: AsyncParsableCommand {
         if let wallpaper {
             mode.wallpaper = wallpaper
         }
+        if let offset {
+            mode.offsetMinutes = offset
+        }
 
         config.modes[modeName] = mode
         try ConfigManager.save(config)
-        print("Updated '\(modeName)': time=\(mode.startTime), appearance=\(mode.appearance), wallpaper=\(mode.wallpaper)")
+        print("Updated '\(modeName)': time=\(mode.startTime), appearance=\(mode.appearance), wallpaper=\(mode.wallpaper), offset=\(mode.offsetMinutes ?? 0) min")
+    }
+}
+
+struct ConfigLocation: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "location",
+        abstract: "Set where to follow the sun from, or show the current location",
+        discussion: """
+            With a location set, morning starts at sunrise, day at solar noon, evening at sunset and night \
+            at civil dusk, each moved by the mode's offset. Other modes keep their fixed start times.
+            """
+    )
+
+    @Option(name: .long, help: "A city, optionally followed by a region or country, such as \"Newcastle, Australia\"")
+    var city: String?
+
+    @Option(name: .long, parsing: .unconditional, help: "Latitude in degrees, from -90 to 90")
+    var latitude: Double?
+
+    @Option(name: .long, parsing: .unconditional, help: "Longitude in degrees, from -180 to 180")
+    var longitude: Double?
+
+    @Flag(name: .long, help: "Remove the location and use fixed start times")
+    var clear = false
+
+    func validate() throws {
+        guard (latitude == nil) == (longitude == nil) else {
+            throw ValidationError("Give both --latitude and --longitude.")
+        }
+        guard [city != nil, latitude != nil, clear].filter(\.self).count <= 1 else {
+            throw ValidationError("Use only one of --city, --latitude with --longitude, or --clear.")
+        }
+    }
+
+    func run() async throws {
+        var config = try loadConfig(ConfigManager.read)
+
+        if clear {
+            config.location = nil
+            try ConfigManager.save(config)
+            print("Location removed. Modes use their fixed start times.")
+        } else if let latitude, let longitude {
+            let location = Location(latitude: latitude, longitude: longitude)
+            config.location = location
+            try ConfigManager.save(config)
+            print("Location set to \(location).")
+        } else if let city {
+            try setCity(city, in: &config)
+        } else if let location = config.location {
+            print("Location: \(location)")
+        } else {
+            print("No location is set. Modes use their fixed start times.")
+        }
+    }
+
+    private func setCity(_ query: String, in config: inout MononiConfig) throws {
+        let matches = City.matching(query)
+        guard let city = matches.first else { throw MononiError.cityNotFound(query) }
+
+        config.location = city.location
+        try ConfigManager.save(config)
+        print("Location set to \(city.fullName) (\(city.location)).")
+
+        let others = matches.dropFirst().prefix(3)
+        if let other = others.first {
+            print("Other matches: \(others.map(\.fullName).joined(separator: "; ")). Add a region or country to choose one, such as \"\(other.name), \(other.country)\".")
+        }
     }
 }
 

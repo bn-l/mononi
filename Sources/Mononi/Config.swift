@@ -1,21 +1,152 @@
+import CoreLocation
 import Foundation
+import Solar
 
 struct ModeConfig: Codable, Sendable {
     var startTime: String
     var appearance: String
     var wallpaper: String
+    /// Minutes to move a sun-following stage from its sun event; negative is earlier.
+    var offsetMinutes: Int?
 
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case startTime, appearance, wallpaper, offsetMinutes
+    }
+
+    /// `startTime` as a 24-hour clock time, or nil when it is not one.
     var startComponents: (hour: Int, minute: Int)? {
         let parts = startTime.split(separator: ":")
         guard parts.count == 2,
-              let h = Int(parts[0]),
-              let m = Int(parts[1]) else { return nil }
+              let h = Int(parts[0]), (0..<24).contains(h),
+              let m = Int(parts[1]), (0..<60).contains(m) else { return nil }
         return (h, m)
+    }
+
+    /// `startTime` on the calendar day containing `day`.
+    func fixedStart(on day: Date, calendar: Calendar) -> Date? {
+        startComponents.flatMap { calendar.date(bySettingHour: $0.hour, minute: $0.minute, second: 0, of: day) }
+    }
+
+    /// Settings in this mode that load but are ignored or fail when applied.
+    func warnings(named name: String) -> [String] {
+        [
+            startComponents == nil
+                ? "Mode \"\(name)\" has startTime \"\(startTime)\", which is not a time from 0:00 to 23:59." : nil,
+            ["light", "dark"].contains(appearance)
+                ? nil : "Mode \"\(name)\" has appearance \"\(appearance)\". Use light or dark.",
+            offsetMinutes != nil && SolarStage(rawValue: name) == nil
+                ? "Mode \"\(name)\" has offsetMinutes, but only morning, day, evening and night follow the sun." : nil,
+        ].compactMap(\.self)
+    }
+}
+
+/// Where to follow the sun from, in degrees.
+struct Location: Codable, Sendable, Equatable, CustomStringConvertible {
+    var latitude: Double
+    var longitude: Double
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case latitude, longitude
+    }
+
+    var description: String { "\(latitude), \(longitude)" }
+
+    /// Values outside the valid range, as sentences.
+    var errors: [String] {
+        [
+            (-90...90).contains(latitude) ? nil : "Latitude \(latitude) is outside -90 to 90.",
+            (-180...180).contains(longitude) ? nil : "Longitude \(longitude) is outside -180 to 180.",
+        ].compactMap(\.self)
+    }
+
+    /// Sun events for the local calendar day containing `day`. Solar computes events for the UTC calendar
+    /// day of the date it is given, so local noon in a zone far ahead of UTC (Auckland is UTC+13 in
+    /// summer) falls on the previous UTC day and returns the previous day's sunrise. 12:00 UTC on the
+    /// local date returns the right day everywhere.
+    func solar(on day: Date, calendar: Calendar) -> Solar? {
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = .gmt
+        var noon = calendar.dateComponents([.year, .month, .day], from: day)
+        noon.hour = 12
+        return utc.date(from: noon).flatMap {
+            Solar(for: $0, coordinate: CLLocationCoordinate2D(latitude: latitude, longitude: longitude))
+        }
+    }
+}
+
+/// The modes that follow the sun when a location is set. A mode with any other name keeps its fixed start time.
+enum SolarStage: String, CaseIterable, Sendable {
+    case morning, day, evening, night
+
+    /// The name of the sun event the stage starts at.
+    var event: String {
+        switch self {
+        case .morning: "sunrise"
+        case .day: "solar noon"
+        case .evening: "sunset"
+        case .night: "civil dusk"
+        }
+    }
+
+    /// When the stage's sun event happens on the day `solar` covers, or nil on a day it does not happen,
+    /// as in polar day or night.
+    func eventDate(in solar: Solar) -> Date? {
+        switch self {
+        case .morning: solar.sunrise
+        // Solar has no solar noon; the midpoint of sunrise and sunset is within a minute of it.
+        case .day: solar.sunrise.flatMap { rise in solar.sunset.map { rise + $0.timeIntervalSince(rise) / 2 } }
+        case .evening: solar.sunset
+        case .night: solar.civilSunset
+        }
+    }
+}
+
+/// A mode starting at a particular moment.
+struct Transition: Sendable {
+    enum Source: Sendable, Equatable {
+        /// The mode's fixed `startTime`.
+        case fixed
+        /// The stage's sun event moved by the mode's offset.
+        case sun(SolarStage)
+        /// The fixed `startTime`, because the stage's sun event does not happen that day.
+        case noSunEvent(SolarStage)
+    }
+
+    let name: String
+    let mode: ModeConfig
+    let date: Date
+    let source: Source
+
+    private static let clock = Date.VerbatimFormatStyle(
+        format: "\(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits)",
+        timeZone: .current, calendar: .current
+    )
+
+    /// The start as a 24-hour time in the current time zone, such as 06:30.
+    var clockTime: String { date.formatted(Self.clock) }
+
+    /// Where the start time came from, such as "sunset +8 min" or "fixed time".
+    var origin: String {
+        switch source {
+        case .fixed: "fixed time"
+        case .sun(let stage):
+            switch mode.offsetMinutes ?? 0 {
+            case 0: stage.event
+            case let minutes: "\(stage.event) \(minutes > 0 ? "+" : "")\(minutes) min"
+            }
+        case .noSunEvent(let stage): "fixed time, no \(stage.event) today"
+        }
     }
 }
 
 struct MononiConfig: Codable, Sendable {
     var modes: [String: ModeConfig]
+    /// Where to follow the sun from. When set, the modes named in `SolarStage` start at their sun events.
+    var location: Location?
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case modes, location
+    }
 
     static let defaultConfig = MononiConfig(
         modes: [
@@ -26,70 +157,71 @@ struct MononiConfig: Codable, Sendable {
         ]
     )
 
-    /// Modes sorted by start time ascending
-    var sortedModes: [(name: String, config: ModeConfig)] {
-        modes.compactMap { name, config in
-            guard config.startComponents != nil else { return nil }
-            return (name, config)
+    /// How the start times are chosen, such as "follows the sun at -33.8714, 151.2125".
+    var basis: String {
+        location.map { "follows the sun at \($0)" } ?? "fixed times"
+    }
+
+    /// The allowed `offsetMinutes`. Twelve hours either way keeps every stage within the days
+    /// `transitions(around:calendar:)` searches.
+    static let offsetRange = -720...720
+
+    /// One day's transitions, earliest first. Modes whose start time cannot be resolved are left out.
+    func transitions(on day: Date, calendar: Calendar = .current) -> [Transition] {
+        let solar = location?.solar(on: day, calendar: calendar)
+        return modes.compactMap { name, mode in
+            let stage = solar == nil ? nil : SolarStage(rawValue: name)
+            if let solar, let stage, let event = stage.eventDate(in: solar) {
+                let offset = TimeInterval((mode.offsetMinutes ?? 0) * 60)
+                return Transition(name: name, mode: mode, date: event + offset, source: .sun(stage))
+            }
+            return mode.fixedStart(on: day, calendar: calendar).map {
+                Transition(name: name, mode: mode, date: $0, source: stage.map { .noSunEvent($0) } ?? .fixed)
+            }
         }
-        .sorted {
-            let a = $0.config.startComponents!
-            let b = $1.config.startComponents!
-            return a.hour * 60 + a.minute < b.hour * 60 + b.minute
+        .sorted { ($0.date, $0.name) < ($1.date, $1.name) }
+    }
+
+    /// The transitions from two days before `date` to two days after, earliest first. An offset moves a
+    /// stage at most 12 hours from its day, so this always includes the transitions either side of `date`.
+    private func transitions(around date: Date, calendar: Calendar) -> [Transition] {
+        (-2...2).compactMap { calendar.date(byAdding: .day, value: $0, to: date) }
+            .flatMap { transitions(on: $0, calendar: calendar) }
+            .sorted { ($0.date, $0.name) < ($1.date, $1.name) }
+    }
+
+    /// The transition that started the mode active at `date`.
+    func activeMode(at date: Date = .now, calendar: Calendar = .current) -> Transition? {
+        transitions(around: date, calendar: calendar).last { $0.date <= date }
+    }
+
+    /// The first transition after `date`.
+    func nextTransition(after date: Date = .now, calendar: Calendar = .current) -> Transition? {
+        transitions(around: date, calendar: calendar).first { $0.date > date }
+    }
+
+    /// Values the schedule cannot use. `ConfigManager` refuses to load or save a config with any of these.
+    var errors: [String] {
+        (location?.errors ?? []) + modes.sorted { $0.key < $1.key }.compactMap { name, mode in
+            mode.offsetMinutes.flatMap {
+                Self.offsetRange.contains($0) ? nil
+                    : "Mode \"\(name)\" has offsetMinutes \($0), outside \(Self.offsetRange.lowerBound) to \(Self.offsetRange.upperBound)."
+            }
         }
     }
 
-    /// Which mode should be active right now?
-    func activeMode(at date: Date = .now) -> (name: String, config: ModeConfig)? {
-        let cal = Calendar.current
-        let nowMinutes = cal.component(.hour, from: date) * 60 + cal.component(.minute, from: date)
-        let sorted = sortedModes
-        guard !sorted.isEmpty else { return nil }
-
-        // Walk backwards — find the latest mode whose start time <= now
-        var active = sorted.last!
-        for mode in sorted {
-            let c = mode.config.startComponents!
-            if c.hour * 60 + c.minute <= nowMinutes {
-                active = mode
-            }
-        }
-        return active
+    /// Settings that load but are ignored or fail when applied.
+    var warnings: [String] {
+        let followsSun = modes.keys.contains { SolarStage(rawValue: $0) != nil }
+        return [
+            modes.isEmpty ? "No modes are configured." : nil,
+            location != nil && !modes.isEmpty && !followsSun
+                ? "A location is set, but no mode is named morning, day, evening or night, so none follows the sun." : nil,
+        ].compactMap(\.self) + modes.sorted { $0.key < $1.key }.flatMap { $0.value.warnings(named: $0.key) }
     }
 
-    /// Next mode transition time after `date`, returns (mode, fire date)
-    func nextTransition(after date: Date = .now) -> (name: String, config: ModeConfig, fireDate: Date)? {
-        let cal = Calendar.current
-        let nowMinutes = cal.component(.hour, from: date) * 60 + cal.component(.minute, from: date)
-        let sorted = sortedModes
-        guard !sorted.isEmpty else { return nil }
-
-        // Find the next mode whose start time is after now
-        for mode in sorted {
-            let c = mode.config.startComponents!
-            let modeMinutes = c.hour * 60 + c.minute
-            if modeMinutes > nowMinutes {
-                var comps = cal.dateComponents([.year, .month, .day], from: date)
-                comps.hour = c.hour
-                comps.minute = c.minute
-                comps.second = 0
-                if let fireDate = cal.date(from: comps) {
-                    return (mode.name, mode.config, fireDate)
-                }
-            }
-        }
-
-        // Wrap around to tomorrow's first mode
-        let first = sorted.first!
-        let c = first.config.startComponents!
-        var comps = cal.dateComponents([.year, .month, .day], from: date)
-        comps.hour = c.hour
-        comps.minute = c.minute
-        comps.second = 0
-        if let tomorrow = cal.date(from: comps).flatMap({ cal.date(byAdding: .day, value: 1, to: $0) }) {
-            return (first.name, first.config, tomorrow)
-        }
-        return nil
+    func validate() throws {
+        guard errors.isEmpty else { throw MononiError.configError(errors.joined(separator: " ")) }
     }
 }
 
@@ -98,15 +230,21 @@ enum ConfigManager {
         .appendingPathComponent(".config/mononi")
     static let configFile = configDir.appendingPathComponent("config.json")
 
+    /// The config as written, or the defaults when there is no file. It skips the range checks so that
+    /// `config set` and `config location` can repair an out-of-range value.
+    static func read() throws -> MononiConfig {
+        try fileData().map(decode) ?? .defaultConfig
+    }
+
+    /// The config, refusing values the schedule cannot use.
     static func load() throws -> MononiConfig {
-        guard FileManager.default.fileExists(atPath: configFile.path) else {
-            return .defaultConfig
-        }
-        let data = try Data(contentsOf: configFile)
-        return try JSONDecoder().decode(MononiConfig.self, from: data)
+        let config = try read()
+        try config.validate()
+        return config
     }
 
     static func save(_ config: MononiConfig) throws {
+        try config.validate()
         try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -117,5 +255,97 @@ enum ConfigManager {
     static func ensureDefault() throws {
         guard !FileManager.default.fileExists(atPath: configFile.path) else { return }
         try save(.defaultConfig)
+    }
+
+    /// Everything wrong with the config file, as sentences. Empty when the file is fine or does not exist.
+    static func problems() -> [String] {
+        do {
+            guard let data = try fileData() else { return [] }
+            let config = try decode(data)
+            let missingWallpapers = config.modes.sorted { $0.key < $1.key }
+                .filter { !ThemeManager.wallpaperExists(named: $0.value.wallpaper) }
+                .map { "Mode \"\($0.key)\" uses wallpaper \"\($0.value.wallpaper)\", which was not found. Run \"mononi wallpapers\" for the list." }
+            return try unknownKeys(in: data) + config.errors + config.warnings + missingWallpapers
+        } catch MononiError.configError(let message) {
+            return [message]
+        } catch {
+            return [error.localizedDescription]
+        }
+    }
+
+    /// The file's contents, or nil when there is no file.
+    private static func fileData() throws -> Data? {
+        guard FileManager.default.fileExists(atPath: configFile.path) else { return nil }
+        do {
+            return try Data(contentsOf: configFile)
+        } catch {
+            throw MononiError.configError("The file could not be read: \(error.localizedDescription)")
+        }
+    }
+
+    private static func decode(_ data: Data) throws -> MononiConfig {
+        do {
+            return try JSONDecoder().decode(MononiConfig.self, from: data)
+        } catch let error as DecodingError {
+            throw MononiError.configError(error.configMessage)
+        }
+    }
+
+    /// Keys that no setting uses, such as a misspelt "ofsetMinutes". JSONDecoder skips these without an error.
+    private static func unknownKeys(in data: Data) throws -> [String] {
+        let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        func unknown<Keys: CodingKey & CaseIterable>(_ object: Any?, _: Keys.Type) -> [String] {
+            guard let object = object as? [String: Any] else { return [] }
+            return Set(object.keys).subtracting(Keys.allCases.map(\.stringValue)).sorted()
+        }
+        let modes = (root?["modes"] as? [String: Any] ?? [:]).sorted { $0.key < $1.key }
+        return unknown(root, MononiConfig.CodingKeys.self).map { "The config has an unknown key \"\($0)\"." }
+            + unknown(root?["location"], Location.CodingKeys.self).map { "The location has an unknown key \"\($0)\"." }
+            + modes.flatMap { name, mode in
+                unknown(mode, ModeConfig.CodingKeys.self).map { "Mode \"\(name)\" has an unknown key \"\($0)\"." }
+            }
+    }
+}
+
+extension DecodingError {
+    /// The error as one sentence about the config file.
+    var configMessage: String {
+        switch self {
+        case .dataCorrupted(let context):
+            let detail = (context.underlyingError as NSError?)?.userInfo[NSDebugDescriptionErrorKey] as? String
+            let sentence = detail ?? context.debugDescription
+            return "The file is not valid JSON. \(sentence)\(sentence.hasSuffix(".") ? "" : ".")"
+        case .keyNotFound(let key, let context):
+            let place = Self.place(context.codingPath)
+            return "\(place.prefix(1).uppercased())\(place.dropFirst()) is missing \"\(key.stringValue)\"."
+        case .valueNotFound(_, let context):
+            guard let key = context.codingPath.last else { return "The file is empty." }
+            return "In \(Self.place(context.codingPath.dropLast())), \"\(key.stringValue)\" has no value."
+        case .typeMismatch(let type, let context):
+            guard let key = context.codingPath.last else { return "The file should contain a JSON object." }
+            return "In \(Self.place(context.codingPath.dropLast())), \"\(key.stringValue)\" should be \(Self.kind(type))."
+        @unknown default:
+            return "\(self)"
+        }
+    }
+
+    /// The part of the config a coding path points to, such as `mode "day"`.
+    private static func place(_ path: some Collection<any CodingKey>) -> String {
+        switch path.map(\.stringValue) {
+        case []: "the config"
+        case ["location"]: "the location"
+        case ["modes"]: "the modes"
+        case let keys where keys.count == 2 && keys[0] == "modes": "mode \"\(keys[1])\""
+        case let keys: keys.joined(separator: ".")
+        }
+    }
+
+    private static func kind(_ type: Any.Type) -> String {
+        switch type {
+        case is Int.Type: "a whole number"
+        case is Double.Type: "a number"
+        case is String.Type: "text in quotes"
+        default: "an object"
+        }
     }
 }

@@ -49,6 +49,11 @@ enum ThemeManager {
         throw MononiError.wallpaperNotFound(name)
     }
 
+    /// Whether `setWallpaper(named:)` can find `name`: an aerial in the manifest, downloaded or not, or a static wallpaper.
+    static func wallpaperExists(named name: String) -> Bool {
+        findAerialAsset(named: name) != nil || findStaticWallpaper(named: name) != nil
+    }
+
     // MARK: - Aerial Wallpapers
 
     private static let aerialsDir: URL = {
@@ -341,6 +346,7 @@ enum MononiError: Error, CustomStringConvertible {
     case downloadFailed(String, String)
     case wallpaperNotApplied(String)
     case configError(String)
+    case cityNotFound(String)
 
     var description: String {
         switch self {
@@ -350,6 +356,7 @@ enum MononiError: Error, CustomStringConvertible {
         case .downloadFailed(let name, let reason): "Failed to download aerial '\(name)': \(reason)"
         case .wallpaperNotApplied(let name): "Applied wallpaper '\(name)' but WallpaperAgent kept reverting it; gave up after \(ThemeManager.aerialMaxAttempts) attempts"
         case .configError(let msg): "Config error: \(msg)"
+        case .cityNotFound(let query): "No city called \"\(query)\" is in the built-in list. Use --latitude and --longitude instead."
         }
     }
 }

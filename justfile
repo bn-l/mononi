@@ -20,6 +20,14 @@ run *ARGS:
 test:
     swift test
 
+# Regenerate the built-in city list from Natural Earth
+cities:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir=$(mktemp -d)
+    curl -sSL -o "$dir/places.geojson" https://raw.githubusercontent.com/nvkelso/natural-earth-vector/v5.1.2/geojson/ne_10m_populated_places_simple.geojson
+    uv run --no-project python -I scripts/cities.py "$dir/places.geojson" Sources/Mononi/Cities.swift
+
 # Generate .icns from icon.png
 [private]
 icns:

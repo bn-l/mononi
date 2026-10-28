@@ -1,6 +1,15 @@
 {
-  "originHash" : "d7a04c4cb01399ed72a81bb5bf1d34d2e6d4482971f6239e73a712f66f06c031",
+  "originHash" : "56d23bd9ca5327dd80dae0da6a068faf8edff78ed774bfdc3df55f742fc59a34",
   "pins" : [
+    {
+      "identity" : "solar",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/ceeK/Solar",
+      "state" : {
+        "revision" : "c31adf999dfd1d3fdc66052e95cc73dd0edbd5ec",
+        "version" : "4.0.1"
+      }
+    },
     {
       "identity" : "swift-argument-parser",
       "kind" : "remoteSourceControl",

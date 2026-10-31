@@ -3,10 +3,11 @@ import Foundation
 import Solar
 
 struct ModeConfig: Codable, Sendable {
-    var startTime: String
+    /// Required except for night, which starts four hours after evening without one.
+    var startTime: String?
     var appearance: String
     var wallpaper: String
-    /// Minutes to move a sun-following stage from its sun event; negative is earlier.
+    /// Minutes to move the stage from its sun event, or night from its start; negative is earlier.
     var offsetMinutes: Int?
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -15,7 +16,7 @@ struct ModeConfig: Codable, Sendable {
 
     /// `startTime` as a 24-hour clock time, or nil when it is not one.
     var startComponents: (hour: Int, minute: Int)? {
-        let parts = startTime.split(separator: ":")
+        guard let parts = startTime?.split(separator: ":") else { return nil }
         guard parts.count == 2,
               let h = Int(parts[0]), (0..<24).contains(h),
               let m = Int(parts[1]), (0..<60).contains(m) else { return nil }
@@ -30,12 +31,12 @@ struct ModeConfig: Codable, Sendable {
     /// Settings in this mode that load but are ignored or fail when applied.
     func warnings(named name: String) -> [String] {
         [
-            startComponents == nil
-                ? "Mode \"\(name)\" has startTime \"\(startTime)\", which is not a time from 0:00 to 23:59." : nil,
+            startTime.flatMap { startComponents == nil ? "Mode \"\(name)\" has startTime \"\($0)\", which is not a time from 0:00 to 23:59." : nil },
+            startTime == nil && name != MononiConfig.nightName ? "Mode \"\(name)\" has no startTime." : nil,
             ["light", "dark"].contains(appearance)
                 ? nil : "Mode \"\(name)\" has appearance \"\(appearance)\". Use light or dark.",
-            offsetMinutes != nil && SolarStage(rawValue: name) == nil
-                ? "Mode \"\(name)\" has offsetMinutes, but only morning, day, evening and night follow the sun." : nil,
+            offsetMinutes != nil && !MononiConfig.canOffset(name)
+                ? "Mode \"\(name)\" has offsetMinutes, but only morning, day, evening and night can have one." : nil,
         ].compactMap(\.self)
     }
 }
@@ -74,17 +75,17 @@ struct Location: Codable, Sendable, Equatable, CustomStringConvertible {
     }
 }
 
-/// The modes that follow the sun when a location is set. A mode with any other name keeps its fixed start time.
+/// The modes that follow the sun when a location is set. Night follows evening instead, and a mode with
+/// any other name keeps its fixed start time.
 enum SolarStage: String, CaseIterable, Sendable {
-    case morning, day, evening, night
+    case morning, day, evening
 
     /// The name of the sun event the stage starts at.
     var event: String {
         switch self {
         case .morning: "sunrise"
         case .day: "solar noon"
-        case .evening: "sunset"
-        case .night: "civil dusk"
+        case .evening: "civil dusk"
         }
     }
 
@@ -95,8 +96,7 @@ enum SolarStage: String, CaseIterable, Sendable {
         case .morning: solar.sunrise
         // Solar has no solar noon; the midpoint of sunrise and sunset is within a minute of it.
         case .day: solar.sunrise.flatMap { rise in solar.sunset.map { rise + $0.timeIntervalSince(rise) / 2 } }
-        case .evening: solar.sunset
-        case .night: solar.civilSunset
+        case .evening: solar.civilSunset
         }
     }
 }
@@ -110,12 +110,16 @@ struct Transition: Sendable {
         case sun(SolarStage)
         /// The fixed `startTime`, because the stage's sun event does not happen that day.
         case noSunEvent(SolarStage)
+        /// Night without a `startTime`: four hours after evening, moved by night's offset.
+        case afterEvening
     }
 
     let name: String
     let mode: ModeConfig
     let date: Date
     let source: Source
+    /// The offset in minutes applied to `date`.
+    let offset: Int
 
     private static let clock = Date.VerbatimFormatStyle(
         format: "\(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits)",
@@ -125,23 +129,22 @@ struct Transition: Sendable {
     /// The start as a 24-hour time in the current time zone, such as 06:30.
     var clockTime: String { date.formatted(Self.clock) }
 
-    /// Where the start time came from, such as "sunset +8 min" or "fixed time".
+    /// Where the start time came from, such as "civil dusk +8 min" or "fixed time".
     var origin: String {
-        switch source {
+        let base = switch source {
         case .fixed: "fixed time"
-        case .sun(let stage):
-            switch mode.offsetMinutes ?? 0 {
-            case 0: stage.event
-            case let minutes: "\(stage.event) \(minutes > 0 ? "+" : "")\(minutes) min"
-            }
+        case .sun(let stage): stage.event
         case .noSunEvent(let stage): "fixed time, no \(stage.event) today"
+        case .afterEvening: "4 h after evening"
         }
+        return offset == 0 ? base : "\(base) \(offset > 0 ? "+" : "")\(offset) min"
     }
 }
 
 struct MononiConfig: Codable, Sendable {
     var modes: [String: ModeConfig]
     /// Where to follow the sun from. When set, the modes named in `SolarStage` start at their sun events.
+    /// Night always starts at its `startTime`, or four hours after evening without one.
     var location: Location?
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -162,30 +165,52 @@ struct MononiConfig: Codable, Sendable {
         location.map { "follows the sun at \($0)" } ?? "fixed times"
     }
 
-    /// The allowed `offsetMinutes`. Twelve hours either way keeps every stage within the days
-    /// `transitions(around:calendar:)` searches.
+    static let nightName = "night"
+    /// How long after evening night starts when night has no `startTime`.
+    static let nightAfterEvening: TimeInterval = 4 * 3600
+
+    /// Whether `offsetMinutes` applies to the mode with this name.
+    static func canOffset(_ name: String) -> Bool {
+        name == nightName || SolarStage(rawValue: name) != nil
+    }
+
+    /// The allowed `offsetMinutes`. With night up to 16 hours after evening, twelve hours either way
+    /// keeps every stage within the days `transitions(around:calendar:)` searches.
     static let offsetRange = -720...720
 
     /// One day's transitions, earliest first. Modes whose start time cannot be resolved are left out.
     func transitions(on day: Date, calendar: Calendar = .current) -> [Transition] {
         let solar = location?.solar(on: day, calendar: calendar)
-        return modes.compactMap { name, mode in
+        let others = modes.filter { $0.key != Self.nightName }.compactMap { name, mode -> Transition? in
             let stage = solar == nil ? nil : SolarStage(rawValue: name)
             if let solar, let stage, let event = stage.eventDate(in: solar) {
-                let offset = TimeInterval((mode.offsetMinutes ?? 0) * 60)
-                return Transition(name: name, mode: mode, date: event + offset, source: .sun(stage))
+                let offset = mode.offsetMinutes ?? 0
+                return Transition(name: name, mode: mode, date: event + TimeInterval(offset * 60), source: .sun(stage), offset: offset)
             }
             return mode.fixedStart(on: day, calendar: calendar).map {
-                Transition(name: name, mode: mode, date: $0, source: stage.map { .noSunEvent($0) } ?? .fixed)
+                Transition(name: name, mode: mode, date: $0, source: stage.map { .noSunEvent($0) } ?? .fixed, offset: 0)
             }
         }
-        .sorted { ($0.date, $0.name) < ($1.date, $1.name) }
+        let evening = others.first { $0.name == SolarStage.evening.rawValue }
+        return (others + [night(on: day, after: evening, calendar: calendar)].compactMap(\.self))
+            .sorted { ($0.date, $0.name) < ($1.date, $1.name) }
     }
 
-    /// The transitions from two days before `date` to two days after, earliest first. An offset moves a
-    /// stage at most 12 hours from its day, so this always includes the transitions either side of `date`.
+    /// Night at its `startTime`, or four hours after `evening` without one, moved by night's offset.
+    private func night(on day: Date, after evening: Transition?, calendar: Calendar) -> Transition? {
+        guard let mode = modes[Self.nightName] else { return nil }
+        let offset = mode.offsetMinutes ?? 0
+        let start: (Date, Transition.Source)? = mode.startTime == nil
+            ? evening.map { ($0.date + Self.nightAfterEvening, .afterEvening) }
+            : mode.fixedStart(on: day, calendar: calendar).map { ($0, .fixed) }
+        return start.map { Transition(name: Self.nightName, mode: mode, date: $0.0 + TimeInterval(offset * 60), source: $0.1, offset: offset) }
+    }
+
+    /// The transitions from three days before `date` to three days after, earliest first. A stage lands
+    /// at most 12 hours before its day and night at most 52 hours after the start of its day, so this
+    /// always includes the transitions either side of `date`.
     private func transitions(around date: Date, calendar: Calendar) -> [Transition] {
-        (-2...2).compactMap { calendar.date(byAdding: .day, value: $0, to: date) }
+        (-3...3).compactMap { calendar.date(byAdding: .day, value: $0, to: date) }
             .flatMap { transitions(on: $0, calendar: calendar) }
             .sorted { ($0.date, $0.name) < ($1.date, $1.name) }
     }
@@ -216,7 +241,7 @@ struct MononiConfig: Codable, Sendable {
         return [
             modes.isEmpty ? "No modes are configured." : nil,
             location != nil && !modes.isEmpty && !followsSun
-                ? "A location is set, but no mode is named morning, day, evening or night, so none follows the sun." : nil,
+                ? "A location is set, but no mode is named morning, day or evening, so none follows the sun." : nil,
         ].compactMap(\.self) + modes.sorted { $0.key < $1.key }.flatMap { $0.value.warnings(named: $0.key) }
     }
 

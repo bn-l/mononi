@@ -90,7 +90,7 @@ struct CLITests {
         #expect(status.status == 0, "\(status.stderr)")
         #expect(status.stderr.isEmpty)
         #expect(status.stdout.contains("Schedule: follows the sun at -32.9295, 151.7702"))
-        for origin in ["sunrise", "solar noon", "sunset", "civil dusk"] {
+        for origin in ["sunrise", "solar noon", "civil dusk", "fixed time"] {
             #expect(status.stdout.contains(origin), "status does not list \(origin):\n\(status.stdout)")
         }
     }
@@ -156,7 +156,7 @@ struct CLITests {
 
         #expect(set.status == 0, "\(set.stderr)")
         #expect(try home.config().modes["evening"]?.offsetMinutes == -15)
-        #expect(status.stdout.contains("sunset -15 min"), "\(status.stdout)")
+        #expect(status.stdout.contains("civil dusk -15 min"), "\(status.stdout)")
     }
 
     @Test("clearing the location returns to fixed times")

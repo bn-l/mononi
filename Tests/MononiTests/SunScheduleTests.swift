@@ -109,12 +109,15 @@ struct SunReferenceTests {
         let today = config.transitions(on: try instant(reference.day, in: cal), calendar: cal)
 
         // Assert
-        for (name, time) in [("morning", reference.sunrise), ("day", reference.noon), ("evening", reference.sunset), ("night", reference.dusk)] {
+        for (name, time) in [("morning", reference.sunrise), ("day", reference.noon), ("evening", reference.dusk)] {
             let transition = try today.named(name)
             #expect(transition.source == .sun(SolarStage(rawValue: name)!))
             let error = abs(transition.date.timeIntervalSince(try instant(reference.day, time, in: cal)))
             #expect(error <= 180, "\(name) starts \(Int(error)) s from the reference \(time)")
         }
+        let night = try today.named("night")
+        #expect(night.source == .fixed)
+        #expect(night.date == (try instant(reference.day, "21:00", in: cal)))
     }
 }
 
@@ -230,7 +233,8 @@ struct SunFallbackTests {
 
         // Assert
         #expect(transitions.map(\.name) == ["morning", "day", "evening", "night"])
-        for transition in transitions {
+        #expect(try transitions.named("night").source == .fixed)
+        for transition in transitions.filter({ $0.name != "night" }) {
             let stage = try #require(SolarStage(rawValue: transition.name))
             #expect(transition.source == .noSunEvent(stage))
             #expect(transition.date == transition.mode.fixedStart(on: date, calendar: cal))
@@ -310,15 +314,15 @@ struct OffsetTests {
         #expect(try moved.named("evening").date == plain.named("evening").date)
         #expect(try moved.named("morning").origin == "sunrise +16 min")
         #expect(try moved.named("day").origin == "solar noon -100 min")
-        #expect(try moved.named("evening").origin == "sunset")
-        #expect(try moved.named("night").origin == "civil dusk")
+        #expect(try moved.named("evening").origin == "civil dusk")
+        #expect(try moved.named("night").origin == "fixed time")
     }
 
     @Test("an offset can push night past midnight, and evening stays active until then")
     func nightPastMidnight() throws {
         // Arrange
         let cal = try calendar("Australia/Sydney")
-        let config = sunConfig(sydney, offsets: ["night": 300]) // civil dusk 19:34 + 5 h = 00:34
+        let config = sunConfig(sydney, offsets: ["night": 300]) // 21:00 + 5 h = 02:00
 
         // Act
         let night = try config.transitions(on: try instant("2026-10-15", in: cal), calendar: cal).named("night")
@@ -326,23 +330,24 @@ struct OffsetTests {
         // Assert
         #expect(cal.component(.day, from: night.date) == 16)
         #expect(config.nextTransition(after: try instant("2026-10-15", "23:00", in: cal), calendar: cal)?.name == "night")
-        #expect(config.activeMode(at: try instant("2026-10-16", "00:10", in: cal), calendar: cal)?.name == "evening")
-        #expect(config.activeMode(at: try instant("2026-10-16", "00:50", in: cal), calendar: cal)?.name == "night")
+        #expect(night.origin == "fixed time +300 min")
+        #expect(config.activeMode(at: try instant("2026-10-16", "01:50", in: cal), calendar: cal)?.name == "evening")
+        #expect(config.activeMode(at: try instant("2026-10-16", "02:10", in: cal), calendar: cal)?.name == "night")
     }
 
     @Test("offsets that swap two stages change their order and which one is active")
     func swappedStages() throws {
         // Arrange
         let cal = try calendar("Australia/Sydney")
-        let config = sunConfig(sydney, offsets: ["evening": 60, "night": -30]) // evening 20:08, night 19:04
+        let config = sunConfig(sydney, offsets: ["evening": 60, "night": -45]) // evening 20:34, night 20:15
 
         // Act
         let names = config.transitions(on: try instant("2026-10-15", in: cal), calendar: cal).map(\.name)
 
         // Assert
         #expect(names == ["morning", "day", "night", "evening"])
-        #expect(config.activeMode(at: try instant("2026-10-15", "19:30", in: cal), calendar: cal)?.name == "night")
-        #expect(config.activeMode(at: try instant("2026-10-15", "20:30", in: cal), calendar: cal)?.name == "evening")
+        #expect(config.activeMode(at: try instant("2026-10-15", "20:25", in: cal), calendar: cal)?.name == "night")
+        #expect(config.activeMode(at: try instant("2026-10-15", "20:45", in: cal), calendar: cal)?.name == "evening")
     }
 
     @Test("a single stage offset by the full 12 hours is always found", arguments: [720, -720])
@@ -375,6 +380,69 @@ struct OffsetTests {
     @Test("offsets of exactly -720 and 720 are valid")
     func atLimits() throws {
         try sunConfig(sydney, offsets: ["morning": -720, "night": 720]).validate()
+    }
+}
+
+// MARK: - Night
+
+@Suite("Night start")
+struct NightTests {
+    func withoutNightStart(_ config: MononiConfig) -> MononiConfig {
+        var config = config
+        config.modes["night"]?.startTime = nil
+        return config
+    }
+
+    @Test("without a startTime, night starts 4 hours after civil dusk, moved by its offset", arguments: [0, 30, -90])
+    func afterEvening(offset: Int) throws {
+        // Arrange
+        let cal = try calendar("Australia/Sydney")
+        let config = withoutNightStart(sunConfig(sydney, offsets: ["evening": 10, "night": offset]))
+
+        // Act
+        let today = config.transitions(on: try instant("2026-10-15", in: cal), calendar: cal)
+
+        // Assert
+        let evening = try today.named("evening")
+        let night = try today.named("night")
+        #expect(night.source == .afterEvening)
+        #expect(night.date.timeIntervalSince(evening.date) == 4 * 3600 + Double(offset * 60))
+        #expect(night.origin == (offset == 0 ? "4 h after evening" : "4 h after evening \(offset > 0 ? "+" : "")\(offset) min"))
+    }
+
+    @Test("without a location or a night startTime, night starts 4 hours after evening's fixed time")
+    func afterFixedEvening() throws {
+        let cal = try calendar("Australia/Sydney")
+        let config = withoutNightStart(.defaultConfig)
+
+        let night = try config.transitions(on: try instant("2026-10-15", in: cal), calendar: cal).named("night")
+
+        #expect(night.date == (try instant("2026-10-15", "21:30", in: cal)))
+    }
+
+    @Test("night after a late evening can cross midnight and is still active then")
+    func afterEveningPastMidnight() throws {
+        let cal = try calendar("Australia/Sydney")
+        let config = withoutNightStart(sunConfig(sydney)) // civil dusk 19:34 + 4 h = 23:34
+        #expect(config.activeMode(at: try instant("2026-10-16", "00:30", in: cal), calendar: cal)?.name == "night")
+        #expect(config.activeMode(at: try instant("2026-10-15", "23:00", in: cal), calendar: cal)?.name == "evening")
+    }
+
+    @Test("night without a startTime and without an evening mode is left out")
+    func noEvening() throws {
+        let cal = try calendar("Australia/Sydney")
+        var config = withoutNightStart(.defaultConfig)
+        config.modes["evening"] = nil
+
+        #expect(!config.transitions(on: try instant("2026-10-15", in: cal), calendar: cal).map(\.name).contains("night"))
+    }
+
+    @Test("night without startTime decodes and has no warnings, but other modes need one")
+    func optionalOnlyForNight() throws {
+        let json = #"{"modes": {"night": {"appearance": "dark", "wallpaper": "X"}, "lunch": {"appearance": "light", "wallpaper": "X"}}}"#
+        let config = try JSONDecoder().decode(MononiConfig.self, from: Data(json.utf8))
+        #expect(config.modes["night"]?.startTime == nil)
+        #expect(config.warnings == ["Mode \"lunch\" has no startTime."])
     }
 }
 

@@ -43,7 +43,7 @@ struct ConfigProblemTests {
         #expect(config.errors.isEmpty)
         #expect(config.warnings == [
             "Mode \"day\" has startTime \"25:00\", which is not a time from 0:00 to 23:59.",
-            "Mode \"lunch\" has offsetMinutes, but only morning, day, evening and night follow the sun.",
+            "Mode \"lunch\" has offsetMinutes, but only morning, day, evening and night can have one.",
             "Mode \"night\" has appearance \"dim\". Use light or dark.",
         ])
     }
@@ -51,7 +51,7 @@ struct ConfigProblemTests {
     @Test("a location with no sun-following mode is a warning")
     func locationWithoutSunModes() {
         let config = MononiConfig(modes: ["lunch": ModeConfig(startTime: "12:30", appearance: "light", wallpaper: "X")], location: sydney)
-        #expect(config.warnings == ["A location is set, but no mode is named morning, day, evening or night, so none follows the sun."])
+        #expect(config.warnings == ["A location is set, but no mode is named morning, day or evening, so none follows the sun."])
     }
 
     @Test("no modes is a warning")
@@ -79,10 +79,10 @@ struct DecodingMessageTests {
          #"In mode "day", "offsetMinutes" should be a whole number."#),
         (#"{"modes": {"day": {"startTime": 12, "appearance": "light", "wallpaper": "X"}}}"#,
          #"In mode "day", "startTime" should be text in quotes."#),
-        (#"{"modes": {"day": {"appearance": "light", "wallpaper": "X"}}}"#,
-         #"Mode "day" is missing "startTime"."#),
-        (#"{"modes": {"day": {"startTime": null, "appearance": "light", "wallpaper": "X"}}}"#,
-         #"In mode "day", "startTime" has no value."#),
+        (#"{"modes": {"day": {"startTime": "12:00", "wallpaper": "X"}}}"#,
+         #"Mode "day" is missing "appearance"."#),
+        (#"{"modes": {"day": {"startTime": "12:00", "appearance": null, "wallpaper": "X"}}}"#,
+         #"In mode "day", "appearance" has no value."#),
         (#"{"location": {"latitude": -33}, "modes": {}}"#,
          #"The location is missing "longitude"."#),
         (#"{"location": {"latitude": "-33", "longitude": 151}, "modes": {}}"#,

@@ -188,8 +188,8 @@ struct ConfigSet: AsyncParsableCommand {
     var offset: Int?
 
     func validate() throws {
-        guard offset == nil || SolarStage(rawValue: modeName) != nil else {
-            throw ValidationError("Only morning, day, evening and night follow the sun, so '\(modeName)' cannot have an offset.")
+        guard offset == nil || MononiConfig.canOffset(modeName) else {
+            throw ValidationError("Only morning, day, evening and night can have an offset, so '\(modeName)' cannot have an offset.")
         }
     }
 
@@ -218,7 +218,7 @@ struct ConfigSet: AsyncParsableCommand {
 
         config.modes[modeName] = mode
         try ConfigManager.save(config)
-        print("Updated '\(modeName)': time=\(mode.startTime), appearance=\(mode.appearance), wallpaper=\(mode.wallpaper), offset=\(mode.offsetMinutes ?? 0) min")
+        print("Updated '\(modeName)': time=\(mode.startTime ?? "none"), appearance=\(mode.appearance), wallpaper=\(mode.wallpaper), offset=\(mode.offsetMinutes ?? 0) min")
     }
 }
 
@@ -227,8 +227,9 @@ struct ConfigLocation: AsyncParsableCommand {
         commandName: "location",
         abstract: "Set where to follow the sun from, or show the current location",
         discussion: """
-            With a location set, morning starts at sunrise, day at solar noon, evening at sunset and night \
-            at civil dusk, each moved by the mode's offset. Other modes keep their fixed start times.
+            With a location set, morning starts at sunrise, day at solar noon and evening at civil dusk, each \
+            moved by the mode's offset. Night starts at its start time, or 4 hours after evening without one. \
+            Other modes keep their fixed start times.
             """
     )
 

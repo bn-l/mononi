@@ -59,14 +59,9 @@ Stored at `~/.config/mononi/config.json`:
 
 ## Location aware auto mode
 
-Add a `location` and the four stages follow the sun with daylight saving handled automatically:
+Add a `location` using the `--city` option with the cli or by adding your long and lat directly to the config file.
 
-| Mode | Starts at |
-|------|-----------|
-| `morning` | sunrise |
-| `day` | solar noon |
-| `evening` | sunset |
-| `night` | dusk |
+mononi will automatically change to morning, day and evening depending on the position of the sun. The change to night either uses the config value for night or is 4 hours after evening.
 
 `offsetMinutes` moves a stage from its sun event; negative values are earlier. It must be between -720 and 720.
 
@@ -81,14 +76,8 @@ Add a `location` and the four stages follow the sun with daylight saving handled
   }
 }
 ```
+- `mononi status` shows you what mode mononi thinks it currently is.
 
-- With a location set, these four modes ignore their `startTime`, except as the fallback below. Clearing the location (`mononi config location --clear`) returns every mode to its `startTime`.
-- Modes with any other name keep their fixed `startTime`.
-- Sun times are exact moments, so a stage keeps its place relative to the sun across a DST change and its clock time moves by an hour, as sunset does. A fixed `startTime` is local clock time; one the clocks skip, such as 2:30 when they go forward, starts at 3:00.
-- On days when a sun event does not happen, such as midsummer above about 60° latitude, that stage uses its `startTime`.
-- `mononi status` lists today's times and where each came from.
-
-`--city` looks the name up in a built-in list of 7,342 places (fully offline). Add a region, country or country code after a comma when a name is shared, as in `"Newcastle, Australia"` or `"Portland, US"`. Sun times come from [Solar](https://github.com/ceeK/Solar).
 
 ## How it works
 
